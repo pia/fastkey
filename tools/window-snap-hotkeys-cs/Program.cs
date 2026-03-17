@@ -12,6 +12,7 @@ namespace WindowSnapHotkeys
         [STAThread]
         private static void Main()
         {
+            DpiAwareness.Enable();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new TrayApplicationContext());
@@ -37,8 +38,13 @@ namespace WindowSnapHotkeys
         private const int VkMenu = 0x12;
 
         private const int SwRestore = 9;
+        private const uint GwOwner = 4;
+        private const int GwlExstyle = -20;
         private const uint MonitorDefaultToNearest = 2;
+        private const uint MonitorDefaultToNull = 0;
         private const uint SwpNoZorder = 0x0004;
+        private const int WsExToolWindow = 0x00000080;
+        private const int DwmwaExtendedFrameBounds = 9;
 
         private static readonly LowLevelKeyboardProc KeyboardProc = KeyboardHookCallback;
 
@@ -254,6 +260,9 @@ namespace WindowSnapHotkeys
             var hideItem = new ToolStripMenuItem("隐藏窗口");
             hideItem.Click += delegate { HideStatusWindow(); };
 
+            var restoreLostWindowsItem = new ToolStripMenuItem("拉回跑丢窗口到主屏");
+            restoreLostWindowsItem.Click += delegate { RestoreLostWindowsToPrimaryScreen(); };
+
             _startupToggleItem = new ToolStripMenuItem();
             _startupToggleItem.Click += delegate { ToggleStartupRegistration(); };
 
@@ -262,6 +271,8 @@ namespace WindowSnapHotkeys
 
             menu.Items.Add(showItem);
             menu.Items.Add(hideItem);
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(restoreLostWindowsItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(_startupToggleItem);
             menu.Items.Add(new ToolStripSeparator());
@@ -320,6 +331,7 @@ namespace WindowSnapHotkeys
                 return;
             }
 
+            EnsureFormVisibleOnPrimaryScreen(_statusForm);
             _statusForm.Show();
             _statusForm.WindowState = FormWindowState.Normal;
             _statusForm.ShowInTaskbar = true;
@@ -489,14 +501,212 @@ namespace WindowSnapHotkeys
                 targetWidth = totalWidth - leftWidth;
             }
 
+            var frameInsets = GetWindowFrameInsets(windowHandle);
+            var targetY = workArea.Top - frameInsets.Top;
+            var adjustedTargetX = targetX - frameInsets.Left;
+            var adjustedWidth = targetWidth + frameInsets.Left + frameInsets.Right;
+            var adjustedHeight = totalHeight + frameInsets.Top + frameInsets.Bottom;
+
             SetWindowPos(
                 windowHandle,
                 IntPtr.Zero,
-                targetX,
-                workArea.Top,
-                targetWidth,
-                totalHeight,
+                adjustedTargetX,
+                targetY,
+                adjustedWidth,
+                adjustedHeight,
                 SwpNoZorder);
+        }
+
+        private void RestoreLostWindowsToPrimaryScreen()
+        {
+            var restoredCount = RestoreOffscreenWindowsToPrimaryScreen();
+            var message = restoredCount > 0
+                ? "已拉回 " + restoredCount + " 个窗口到主屏。"
+                : "没有发现跑丢到屏幕外的窗口。";
+
+            _notifyIcon.ShowBalloonTip(
+                1500,
+                "Window Snap Hotkeys",
+                message,
+                ToolTipIcon.Info);
+        }
+
+        private static int RestoreOffscreenWindowsToPrimaryScreen()
+        {
+            var primaryScreen = Screen.PrimaryScreen;
+            if (primaryScreen == null)
+            {
+                return 0;
+            }
+
+            var primaryWorkArea = RectangleToRect(primaryScreen.WorkingArea);
+            var restoredCount = 0;
+
+            EnumWindows(
+                delegate(IntPtr windowHandle, IntPtr lParam)
+                {
+                    if (!CanRestoreOffscreenWindow(windowHandle))
+                    {
+                        return true;
+                    }
+
+                    if (!MoveWindowToPrimaryScreen(windowHandle, primaryWorkArea))
+                    {
+                        return true;
+                    }
+
+                    restoredCount++;
+                    return true;
+                },
+                IntPtr.Zero);
+
+            return restoredCount;
+        }
+
+        private static bool CanRestoreOffscreenWindow(IntPtr windowHandle)
+        {
+            if (windowHandle == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            if (!IsWindowVisible(windowHandle))
+            {
+                return false;
+            }
+
+            if (windowHandle == GetShellWindow())
+            {
+                return false;
+            }
+
+            if (IsIconic(windowHandle))
+            {
+                return false;
+            }
+
+            if (GetWindow(windowHandle, GwOwner) != IntPtr.Zero)
+            {
+                return false;
+            }
+
+            if (GetWindowTextLength(windowHandle) <= 0)
+            {
+                return false;
+            }
+
+            var exStyle = GetWindowLongPtr(windowHandle, GwlExstyle).ToInt64();
+            if ((exStyle & WsExToolWindow) != 0)
+            {
+                return false;
+            }
+
+            if (MonitorFromWindow(windowHandle, MonitorDefaultToNull) != IntPtr.Zero)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool MoveWindowToPrimaryScreen(IntPtr windowHandle, Rect primaryWorkArea)
+        {
+            if (IsZoomed(windowHandle))
+            {
+                ShowWindow(windowHandle, SwRestore);
+            }
+
+            Rect currentRect;
+            if (!GetWindowRect(windowHandle, out currentRect))
+            {
+                return false;
+            }
+
+            var currentWidth = currentRect.Right - currentRect.Left;
+            var currentHeight = currentRect.Bottom - currentRect.Top;
+            var maxWidth = primaryWorkArea.Right - primaryWorkArea.Left;
+            var maxHeight = primaryWorkArea.Bottom - primaryWorkArea.Top;
+
+            if (currentWidth <= 0 || currentHeight <= 0 || maxWidth <= 0 || maxHeight <= 0)
+            {
+                return false;
+            }
+
+            var targetWidth = Math.Min(currentWidth, maxWidth);
+            var targetHeight = Math.Min(currentHeight, maxHeight);
+            var targetX = primaryWorkArea.Left + (maxWidth - targetWidth) / 2;
+            var targetY = primaryWorkArea.Top + (maxHeight - targetHeight) / 2;
+
+            return SetWindowPos(
+                windowHandle,
+                IntPtr.Zero,
+                targetX,
+                targetY,
+                targetWidth,
+                targetHeight,
+                SwpNoZorder);
+        }
+
+        private static void EnsureFormVisibleOnPrimaryScreen(Form form)
+        {
+            if (form == null || form.IsDisposed)
+            {
+                return;
+            }
+
+            var primaryScreen = Screen.PrimaryScreen;
+            if (primaryScreen == null)
+            {
+                return;
+            }
+
+            var formBounds = form.Bounds;
+            var workingArea = primaryScreen.WorkingArea;
+            if (formBounds.IntersectsWith(workingArea))
+            {
+                return;
+            }
+
+            var targetX = workingArea.Left + Math.Max(0, (workingArea.Width - form.Width) / 2);
+            var targetY = workingArea.Top + Math.Max(0, (workingArea.Height - form.Height) / 2);
+            form.StartPosition = FormStartPosition.Manual;
+            form.Location = new Point(targetX, targetY);
+        }
+
+        private static FrameInsets GetWindowFrameInsets(IntPtr windowHandle)
+        {
+            Rect windowRect;
+            if (!GetWindowRect(windowHandle, out windowRect))
+            {
+                return FrameInsets.Empty;
+            }
+
+            Rect extendedFrameBounds;
+            if (DwmGetWindowAttribute(
+                windowHandle,
+                DwmwaExtendedFrameBounds,
+                out extendedFrameBounds,
+                Marshal.SizeOf(typeof(Rect))) != 0)
+            {
+                return FrameInsets.Empty;
+            }
+
+            var left = Math.Max(0, extendedFrameBounds.Left - windowRect.Left);
+            var top = Math.Max(0, extendedFrameBounds.Top - windowRect.Top);
+            var right = Math.Max(0, windowRect.Right - extendedFrameBounds.Right);
+            var bottom = Math.Max(0, windowRect.Bottom - extendedFrameBounds.Bottom);
+
+            return new FrameInsets(left, top, right, bottom);
+        }
+
+        private static Rect RectangleToRect(Rectangle rectangle)
+        {
+            var rect = new Rect();
+            rect.Left = rectangle.Left;
+            rect.Top = rectangle.Top;
+            rect.Right = rectangle.Right;
+            rect.Bottom = rectangle.Bottom;
+            return rect;
         }
 
         private void ExitApplication()
@@ -562,6 +772,24 @@ namespace WindowSnapHotkeys
             Right
         }
 
+        private struct FrameInsets
+        {
+            public static readonly FrameInsets Empty = new FrameInsets(0, 0, 0, 0);
+
+            public FrameInsets(int left, int top, int right, int bottom)
+            {
+                Left = left;
+                Top = top;
+                Right = right;
+                Bottom = bottom;
+            }
+
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
         [StructLayout(LayoutKind.Sequential)]
         private struct Rect
         {
@@ -591,6 +819,7 @@ namespace WindowSnapHotkeys
         }
 
         private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern IntPtr SetWindowsHookEx(
@@ -625,10 +854,28 @@ namespace WindowSnapHotkeys
         private static extern bool IsZoomed(IntPtr hWnd);
 
         [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern int GetWindowTextLength(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetShellWindow();
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+
+        [DllImport("user32.dll")]
         private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
 
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MonitorInfo lpmi);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool GetWindowRect(IntPtr hWnd, out Rect lpRect);
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool SetWindowPos(
@@ -640,9 +887,32 @@ namespace WindowSnapHotkeys
             int cy,
             uint uFlags);
 
+        [DllImport("user32.dll", EntryPoint = "GetWindowLong", SetLastError = true)]
+        private static extern int GetWindowLong32(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr", SetLastError = true)]
+        private static extern IntPtr GetWindowLongPtr64(IntPtr hWnd, int nIndex);
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmGetWindowAttribute(
+            IntPtr hwnd,
+            int dwAttribute,
+            out Rect pvAttribute,
+            int cbAttribute);
+
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool DestroyIcon(IntPtr hIcon);
+
+        private static IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex)
+        {
+            if (IntPtr.Size == 8)
+            {
+                return GetWindowLongPtr64(hWnd, nIndex);
+            }
+
+            return new IntPtr(GetWindowLong32(hWnd, nIndex));
+        }
     }
 
     internal sealed class StatusForm : Form
@@ -665,15 +935,15 @@ namespace WindowSnapHotkeys
                 Left = 20,
                 Top = 20,
                 Width = 360,
-                Height = 90,
-                Text = "程序正在系统托盘运行。\r\n\r\nAlt + A：当前窗口贴靠左半屏\r\nAlt + D：当前窗口贴靠右半屏\r\n双击托盘图标：显示/隐藏本窗口"
+                Height = 110,
+                Text = "程序正在系统托盘运行。\r\n\r\nAlt + A：当前窗口贴靠左半屏\r\nAlt + D：当前窗口贴靠右半屏\r\n右击托盘图标：可拉回跑丢窗口到主屏\r\n双击托盘图标：显示/隐藏本窗口"
             };
 
             var hideButton = new Button
             {
                 Text = "隐藏到托盘",
                 Left = 140,
-                Top = 130,
+                Top = 145,
                 Width = 120,
                 Height = 32
             };
@@ -689,5 +959,59 @@ namespace WindowSnapHotkeys
             Controls.Add(descriptionLabel);
             Controls.Add(hideButton);
         }
+    }
+
+    internal static class DpiAwareness
+    {
+        private static readonly IntPtr DpiAwarenessContextPerMonitorAwareV2 = new IntPtr(-4);
+
+        public static void Enable()
+        {
+            try
+            {
+                if (SetProcessDpiAwarenessContext(DpiAwarenessContextPerMonitorAwareV2))
+                {
+                    return;
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                if (SetProcessDpiAwareness(ProcessDpiAwareness.ProcessPerMonitorDpiAware) == 0)
+                {
+                    return;
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                SetProcessDPIAware();
+            }
+            catch
+            {
+            }
+        }
+
+        private enum ProcessDpiAwareness
+        {
+            ProcessDpiUnaware = 0,
+            ProcessSystemDpiAware = 1,
+            ProcessPerMonitorDpiAware = 2
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool SetProcessDPIAware();
+
+        [DllImport("user32.dll")]
+        private static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
+
+        [DllImport("shcore.dll")]
+        private static extern int SetProcessDpiAwareness(ProcessDpiAwareness value);
     }
 }
