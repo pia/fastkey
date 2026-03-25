@@ -2,6 +2,7 @@
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $source = Join-Path $scriptDir 'Program.cs'
+$logicSource = Join-Path $scriptDir 'HotkeyLogic.cs'
 $distDir = Join-Path $scriptDir 'dist'
 $output = Join-Path $distDir 'WindowSnapHotkeys.exe'
 
@@ -18,7 +19,7 @@ if (!(Test-Path $cscPath)) {
   throw 'Cannot find csc.exe on this machine.'
 }
 
-& $cscPath /nologo /target:winexe /optimize+ /r:System.Windows.Forms.dll /r:System.Drawing.dll /out:$output $source
+& $cscPath /nologo /target:winexe /optimize+ /r:System.Windows.Forms.dll /r:System.Drawing.dll /out:$output $source $logicSource
 
 if ($LASTEXITCODE -ne 0) {
   throw "Build failed with exit code $LASTEXITCODE"

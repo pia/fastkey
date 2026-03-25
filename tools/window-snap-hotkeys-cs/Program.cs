@@ -1,8 +1,10 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using Microsoft.Win32;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace WindowSnapHotkeys
@@ -33,10 +35,6 @@ namespace WindowSnapHotkeys
 
         private const uint LlkhfAltDown = 0x20;
 
-        private const int VkA = 0x41;
-        private const int VkD = 0x44;
-        private const int VkMenu = 0x12;
-
         private const int SwRestore = 9;
         private const uint GwOwner = 4;
         private const int GwlExstyle = -20;
@@ -54,17 +52,20 @@ namespace WindowSnapHotkeys
         private readonly ContextMenuStrip _trayMenu;
         private readonly StatusForm _statusForm;
         private readonly Icon _trayIcon;
+        private readonly HotkeyStateMachine _hotkeyStateMachine;
+        private readonly ConcurrentQueue<SnapRequest> _pendingSnapRequests;
         private ToolStripMenuItem _startupToggleItem;
 
         private IntPtr _hookHandle;
-        private bool _leftHandled;
-        private bool _rightHandled;
+        private int _snapWorkerScheduled;
         private bool _isExiting;
         private bool _isDisposed;
 
         public TrayApplicationContext()
         {
             _instance = this;
+            _hotkeyStateMachine = new HotkeyStateMachine();
+            _pendingSnapRequests = new ConcurrentQueue<SnapRequest>();
 
             _statusForm = new StatusForm();
             _statusForm.HideRequested += HideStatusWindow;
@@ -389,67 +390,26 @@ namespace WindowSnapHotkeys
 
             var keyboardData = (KbdLlHookStruct)Marshal.PtrToStructure(lParam, typeof(KbdLlHookStruct));
             var vkCode = (int)keyboardData.vkCode;
+            var result = _hotkeyStateMachine.ProcessKeyEvent(
+                isKeyDown,
+                isKeyUp,
+                vkCode,
+                (keyboardData.flags & LlkhfAltDown) != 0);
 
-            if (isKeyDown && IsAltPressed(keyboardData.flags))
+            if (result.TriggeredSide.HasValue)
             {
-                if (vkCode == VkA)
-                {
-                    if (!_leftHandled)
-                    {
-                        SnapForegroundWindow(SnapSide.Left);
-                        _leftHandled = true;
-                    }
-
-                    return (IntPtr)1;
-                }
-
-                if (vkCode == VkD)
-                {
-                    if (!_rightHandled)
-                    {
-                        SnapForegroundWindow(SnapSide.Right);
-                        _rightHandled = true;
-                    }
-
-                    return (IntPtr)1;
-                }
+                EnqueueSnapRequest(result.TriggeredSide.Value);
             }
 
-            if (isKeyUp)
+            if (result.ShouldConsumeEvent)
             {
-                if (vkCode == VkA && _leftHandled)
-                {
-                    _leftHandled = false;
-                    return (IntPtr)1;
-                }
-
-                if (vkCode == VkD && _rightHandled)
-                {
-                    _rightHandled = false;
-                    return (IntPtr)1;
-                }
-
-                if (vkCode == VkMenu)
-                {
-                    _leftHandled = false;
-                    _rightHandled = false;
-                }
+                return (IntPtr)1;
             }
 
             return CallNextHookEx(_hookHandle, nCode, wParam, lParam);
         }
 
-        private static bool IsAltPressed(uint flags)
-        {
-            if ((flags & LlkhfAltDown) != 0)
-            {
-                return true;
-            }
-
-            return (GetAsyncKeyState(VkMenu) & 0x8000) != 0;
-        }
-
-        private static void SnapForegroundWindow(SnapSide side)
+        private void EnqueueSnapRequest(SnapSide side)
         {
             var windowHandle = GetForegroundWindow();
             if (windowHandle == IntPtr.Zero)
@@ -457,6 +417,42 @@ namespace WindowSnapHotkeys
                 return;
             }
 
+            _pendingSnapRequests.Enqueue(new SnapRequest(windowHandle, side));
+            SchedulePendingSnapProcessing();
+        }
+
+        private void SchedulePendingSnapProcessing()
+        {
+            if (Interlocked.Exchange(ref _snapWorkerScheduled, 1) != 0)
+            {
+                return;
+            }
+
+            ThreadPool.QueueUserWorkItem(ProcessPendingSnapRequests);
+        }
+
+        private void ProcessPendingSnapRequests(object state)
+        {
+            try
+            {
+                SnapRequest request;
+                while (_pendingSnapRequests.TryDequeue(out request))
+                {
+                    SnapWindow(request.WindowHandle, request.Side);
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _snapWorkerScheduled, 0);
+                if (!_pendingSnapRequests.IsEmpty)
+                {
+                    SchedulePendingSnapProcessing();
+                }
+            }
+        }
+
+        private static void SnapWindow(IntPtr windowHandle, SnapSide side)
+        {
             if (IsIconic(windowHandle) || IsZoomed(windowHandle))
             {
                 ShowWindow(windowHandle, SwRestore);
@@ -766,10 +762,16 @@ namespace WindowSnapHotkeys
             }
         }
 
-        private enum SnapSide
+        private struct SnapRequest
         {
-            Left,
-            Right
+            public SnapRequest(IntPtr windowHandle, SnapSide side)
+            {
+                WindowHandle = windowHandle;
+                Side = side;
+            }
+
+            public IntPtr WindowHandle;
+            public SnapSide Side;
         }
 
         private struct FrameInsets
@@ -837,9 +839,6 @@ namespace WindowSnapHotkeys
 
         [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern IntPtr GetModuleHandle(string lpModuleName);
-
-        [DllImport("user32.dll")]
-        private static extern short GetAsyncKeyState(int vKey);
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
