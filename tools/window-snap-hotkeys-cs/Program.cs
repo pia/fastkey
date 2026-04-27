@@ -54,10 +54,13 @@ namespace WindowSnapHotkeys
         private readonly Icon _trayIcon;
         private readonly HotkeyStateMachine _hotkeyStateMachine;
         private readonly ConcurrentQueue<SnapRequest> _pendingSnapRequests;
+        private HotkeyMessageWindow _hotkeyMessageWindow;
+        private System.Windows.Forms.Timer _hookWatchdogTimer;
         private ToolStripMenuItem _startupToggleItem;
 
         private IntPtr _hookHandle;
         private int _snapWorkerScheduled;
+        private bool _usingKeyboardHookFallback;
         private bool _isExiting;
         private bool _isDisposed;
 
@@ -84,10 +87,10 @@ namespace WindowSnapHotkeys
             };
             _notifyIcon.DoubleClick += OnTrayIconDoubleClick;
 
-            if (!InstallKeyboardHook())
+            if (!InstallHotkeyInput())
             {
                 MessageBox.Show(
-                    "无法安装全局键盘钩子，程序将退出。",
+                    "无法注册全局快捷键，程序将退出。",
                     "Window Snap Hotkeys",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
@@ -117,7 +120,7 @@ namespace WindowSnapHotkeys
 
                 var startupValue = "\"" + executablePath + "\"";
 
-                using (var runKey = Registry.CurrentUser.OpenSubKey(StartupRegistryPath, true))
+                using (var runKey = Registry.CurrentUser.CreateSubKey(StartupRegistryPath))
                 {
                     if (runKey == null)
                     {
@@ -173,7 +176,7 @@ namespace WindowSnapHotkeys
         {
             try
             {
-                using (var runKey = Registry.CurrentUser.OpenSubKey(StartupRegistryPath, true))
+                using (var runKey = Registry.CurrentUser.CreateSubKey(StartupRegistryPath))
                 {
                     if (runKey == null)
                     {
@@ -361,10 +364,61 @@ namespace WindowSnapHotkeys
             HideStatusWindow();
         }
 
+        private bool InstallHotkeyInput()
+        {
+            _hotkeyMessageWindow = new HotkeyMessageWindow(EnqueueSnapRequest);
+            if (_hotkeyMessageWindow.RegisterHotkeys())
+            {
+                return true;
+            }
+
+            _hotkeyMessageWindow.Dispose();
+            _hotkeyMessageWindow = null;
+
+            _usingKeyboardHookFallback = true;
+            if (!InstallKeyboardHook())
+            {
+                return false;
+            }
+
+            StartKeyboardHookWatchdog();
+            return true;
+        }
+
         private bool InstallKeyboardHook()
         {
             _hookHandle = SetWindowsHookEx(WhKeyboardLl, KeyboardProc, GetModuleHandle(null), 0);
             return _hookHandle != IntPtr.Zero;
+        }
+
+        private void StartKeyboardHookWatchdog()
+        {
+            _hookWatchdogTimer = new System.Windows.Forms.Timer();
+            _hookWatchdogTimer.Interval = 60000;
+            _hookWatchdogTimer.Tick += delegate { ReinstallKeyboardHook(); };
+            _hookWatchdogTimer.Start();
+        }
+
+        private void ReinstallKeyboardHook()
+        {
+            if (!_usingKeyboardHookFallback || _isDisposed || _isExiting)
+            {
+                return;
+            }
+
+            var oldHookHandle = _hookHandle;
+            var newHookHandle = SetWindowsHookEx(WhKeyboardLl, KeyboardProc, GetModuleHandle(null), 0);
+            if (newHookHandle == IntPtr.Zero)
+            {
+                return;
+            }
+
+            _hookHandle = newHookHandle;
+
+            if (oldHookHandle != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(oldHookHandle);
+            }
         }
 
         private static IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -379,31 +433,37 @@ namespace WindowSnapHotkeys
 
         private IntPtr HandleKeyboardHook(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode < 0)
+            try
             {
-                return CallNextHookEx(_hookHandle, nCode, wParam, lParam);
+                if (nCode < 0)
+                {
+                    return CallNextHookEx(_hookHandle, nCode, wParam, lParam);
+                }
+
+                var message = wParam.ToInt32();
+                var isKeyDown = message == WmKeyDown || message == WmSysKeyDown;
+                var isKeyUp = message == WmKeyUp || message == WmSysKeyUp;
+
+                var keyboardData = (KbdLlHookStruct)Marshal.PtrToStructure(lParam, typeof(KbdLlHookStruct));
+                var vkCode = (int)keyboardData.vkCode;
+                var result = _hotkeyStateMachine.ProcessKeyEvent(
+                    isKeyDown,
+                    isKeyUp,
+                    vkCode,
+                    (keyboardData.flags & LlkhfAltDown) != 0);
+
+                if (result.TriggeredSide.HasValue)
+                {
+                    EnqueueSnapRequest(result.TriggeredSide.Value);
+                }
+
+                if (result.ShouldConsumeEvent)
+                {
+                    return (IntPtr)1;
+                }
             }
-
-            var message = wParam.ToInt32();
-            var isKeyDown = message == WmKeyDown || message == WmSysKeyDown;
-            var isKeyUp = message == WmKeyUp || message == WmSysKeyUp;
-
-            var keyboardData = (KbdLlHookStruct)Marshal.PtrToStructure(lParam, typeof(KbdLlHookStruct));
-            var vkCode = (int)keyboardData.vkCode;
-            var result = _hotkeyStateMachine.ProcessKeyEvent(
-                isKeyDown,
-                isKeyUp,
-                vkCode,
-                (keyboardData.flags & LlkhfAltDown) != 0);
-
-            if (result.TriggeredSide.HasValue)
+            catch
             {
-                EnqueueSnapRequest(result.TriggeredSide.Value);
-            }
-
-            if (result.ShouldConsumeEvent)
-            {
-                return (IntPtr)1;
             }
 
             return CallNextHookEx(_hookHandle, nCode, wParam, lParam);
@@ -438,7 +498,13 @@ namespace WindowSnapHotkeys
                 SnapRequest request;
                 while (_pendingSnapRequests.TryDequeue(out request))
                 {
-                    SnapWindow(request.WindowHandle, request.Side);
+                    try
+                    {
+                        SnapWindow(request.WindowHandle, request.Side);
+                    }
+                    catch
+                    {
+                    }
                 }
             }
             finally
@@ -739,6 +805,19 @@ namespace WindowSnapHotkeys
 
             _instance = null;
 
+            if (_hookWatchdogTimer != null)
+            {
+                _hookWatchdogTimer.Stop();
+                _hookWatchdogTimer.Dispose();
+                _hookWatchdogTimer = null;
+            }
+
+            if (_hotkeyMessageWindow != null)
+            {
+                _hotkeyMessageWindow.Dispose();
+                _hotkeyMessageWindow = null;
+            }
+
             if (_notifyIcon != null)
             {
                 _notifyIcon.Visible = false;
@@ -912,6 +991,127 @@ namespace WindowSnapHotkeys
 
             return new IntPtr(GetWindowLong32(hWnd, nIndex));
         }
+    }
+
+    internal sealed class HotkeyMessageWindow : NativeWindow, IDisposable
+    {
+        private const int WmHotkey = 0x0312;
+        private const int LeftHotkeyId = 1;
+        private const int RightHotkeyId = 2;
+        private const uint ModAlt = 0x0001;
+        private const uint ModNoRepeat = 0x4000;
+        private const uint VkA = 0x41;
+        private const uint VkD = 0x44;
+
+        private readonly Action<SnapSide> _hotkeyTriggered;
+        private bool _registeredLeft;
+        private bool _registeredRight;
+        private bool _isDisposed;
+
+        public HotkeyMessageWindow(Action<SnapSide> hotkeyTriggered)
+        {
+            if (hotkeyTriggered == null)
+            {
+                throw new ArgumentNullException("hotkeyTriggered");
+            }
+
+            _hotkeyTriggered = hotkeyTriggered;
+            CreateHandle(new CreateParams());
+        }
+
+        public bool RegisterHotkeys()
+        {
+            if (Handle == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            _registeredLeft = RegisterHotkeyWithNoRepeatFallback(LeftHotkeyId, VkA);
+            _registeredRight = RegisterHotkeyWithNoRepeatFallback(RightHotkeyId, VkD);
+
+            if (_registeredLeft && _registeredRight)
+            {
+                return true;
+            }
+
+            UnregisterHotkeys();
+            return false;
+        }
+
+        protected override void WndProc(ref Message message)
+        {
+            if (message.Msg == WmHotkey)
+            {
+                var hotkeyId = message.WParam.ToInt32();
+                if (hotkeyId == LeftHotkeyId)
+                {
+                    _hotkeyTriggered(SnapSide.Left);
+                    return;
+                }
+
+                if (hotkeyId == RightHotkeyId)
+                {
+                    _hotkeyTriggered(SnapSide.Right);
+                    return;
+                }
+            }
+
+            base.WndProc(ref message);
+        }
+
+        public void Dispose()
+        {
+            if (_isDisposed)
+            {
+                return;
+            }
+
+            _isDisposed = true;
+            UnregisterHotkeys();
+
+            if (Handle != IntPtr.Zero)
+            {
+                DestroyHandle();
+            }
+        }
+
+        private bool RegisterHotkeyWithNoRepeatFallback(int id, uint virtualKey)
+        {
+            if (RegisterHotKey(Handle, id, ModAlt | ModNoRepeat, virtualKey))
+            {
+                return true;
+            }
+
+            return RegisterHotKey(Handle, id, ModAlt, virtualKey);
+        }
+
+        private void UnregisterHotkeys()
+        {
+            if (Handle == IntPtr.Zero)
+            {
+                return;
+            }
+
+            if (_registeredLeft)
+            {
+                UnregisterHotKey(Handle, LeftHotkeyId);
+                _registeredLeft = false;
+            }
+
+            if (_registeredRight)
+            {
+                UnregisterHotKey(Handle, RightHotkeyId);
+                _registeredRight = false;
+            }
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
     }
 
     internal sealed class StatusForm : Form
